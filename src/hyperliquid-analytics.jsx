@@ -93,10 +93,42 @@ function generateDemoFills() {
 }
 
 // Hyperliquid API
-async function fetchUserFills(address, startTime = 0) {
+const MAX_FILLS = 100000;
+
+function fillsCacheKey(address) { return "hl_fills_" + address.toLowerCase(); }
+
+function getCachedFills(address) {
+  try {
+    const raw = localStorage.getItem(fillsCacheKey(address));
+    if (!raw) return null;
+    const { fills, ts } = JSON.parse(raw);
+    if (Date.now() - ts > 5 * 60 * 1000) return null; // 5 min TTL
+    return fills;
+  } catch { return null; }
+}
+
+function setCachedFills(address, fills) {
+  try { localStorage.setItem(fillsCacheKey(address), JSON.stringify({ fills, ts: Date.now() })); }
+  catch { /* storage full — ignore */ }
+}
+
+function clearCachedFills(address) {
+  try { localStorage.removeItem(fillsCacheKey(address)); } catch { /* ignore */ }
+}
+
+async function fetchRecentFills(address) {
   const resp = await fetch(HL_INFO_URL, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ type: "userFills", user: address, startTime })
+    body: JSON.stringify({ type: "userFills", user: address, aggregateByTime: true })
+  });
+  if (!resp.ok) throw new Error("API Error: " + resp.status);
+  return resp.json();
+}
+
+async function fetchUserFillsByTime(address, startTime, endTime) {
+  const resp = await fetch(HL_INFO_URL, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type: "userFillsByTime", user: address, startTime, endTime, aggregateByTime: true })
   });
   if (!resp.ok) throw new Error("API Error: " + resp.status);
   return resp.json();
@@ -111,20 +143,52 @@ async function fetchUserState(address) {
   return resp.json();
 }
 
+function deduplicateFills(fills) {
+  const seen = new Set();
+  return fills.filter(f => {
+    const key = f.tid ?? (f.time + ":" + f.coin + ":" + f.px + ":" + f.sz + ":" + f.side);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 async function fetchAllFills(address, onProgress) {
-  let allFills = [], startTime = 0, page = 0;
-  while (page < 50) {
-    onProgress && onProgress("Fetching fills page " + (page + 1) + "...");
-    let fills;
-    try { fills = await fetchUserFills(address, startTime); }
-    catch (e) { if (page === 0) throw e; break; }
-    if (!fills || fills.length === 0) break;
-    allFills = allFills.concat(fills);
-    if (fills.length < 2000) break;
-    startTime = fills[fills.length - 1].time + 1;
-    page++;
-    await new Promise(r => setTimeout(r, 200));
+  const cached = getCachedFills(address);
+  if (cached) { onProgress && onProgress("Loaded " + cached.length + " fills from cache"); return cached; }
+
+  // Source A: recent buffer (most recent fills, no time params)
+  onProgress && onProgress("Fetching recent fills...");
+  let recentFills;
+  try { recentFills = await fetchRecentFills(address); }
+  catch (e) { throw e; }
+  if (!recentFills || recentFills.length === 0) return [];
+
+  let allFills = [...recentFills];
+  onProgress && onProgress("Fetched " + allFills.length + " fills...");
+
+  // Source B: walk backward from oldest fill in recent buffer
+  if (recentFills.length >= 2000) {
+    const oldestRecent = Math.min(...recentFills.map(f => f.time));
+    let endTime = oldestRecent - 1;
+    while (allFills.length < MAX_FILLS) {
+      await new Promise(r => setTimeout(r, 200));
+      onProgress && onProgress("Fetched " + allFills.length + " fills...");
+      let fills;
+      try { fills = await fetchUserFillsByTime(address, 0, endTime); }
+      catch (e) { break; }
+      if (!fills || fills.length === 0) break;
+      allFills = allFills.concat(fills);
+      if (fills.length < 2000) break;
+      const oldest = Math.min(...fills.map(f => f.time));
+      endTime = oldest - 1;
+    }
   }
+
+  allFills = deduplicateFills(allFills);
+  allFills.sort((a, b) => a.time - b.time);
+  onProgress && onProgress("Fetched " + allFills.length + " fills total");
+  setCachedFills(address, allFills);
   return allFills;
 }
 
@@ -140,7 +204,9 @@ function processHyperliquidFills(fills) {
     if (!positions[coin]) positions[coin] = { entries: [], totalSize: 0, side: null, fees: 0, startTime: null, fills: [], realizedPnl: 0 };
     const pos = positions[coin];
     const size = parseFloat(fill.sz), price = parseFloat(fill.px);
-    const fee = parseFloat(fill.fee || "0"), closedPnl = parseFloat(fill.closedPnl || "0");
+    const fee = parseFloat(fill.fee || "0") + parseFloat(fill.builderFee || "0");
+    const closedPnl = parseFloat(fill.closedPnl || "0");
+    const isClosing = fill.dir === "Close Long" || fill.dir === "Close Short";
     const isBuy = fill.side === "B" || fill.side === "Buy" || fill.dir === "Open Long" || fill.dir === "Close Short";
     pos.fees += fee;
     pos.fills.push({ ...fill, parsedSize: size, parsedPrice: price, parsedFee: fee, isBuy });
@@ -155,7 +221,7 @@ function processHyperliquidFills(fills) {
       const sameDir = (pos.side === "Long" && isBuy) || (pos.side === "Short" && !isBuy);
       if (sameDir) { pos.entries.push({ price, size }); pos.totalSize += size; }
       else {
-        pos.realizedPnl += closedPnl;
+        if (isClosing) pos.realizedPnl += closedPnl;
         pos.totalSize -= size;
         if (pos.totalSize <= 0.00001) {
           const avgEntry = pos.entries.reduce((s, e) => s + e.price * e.size, 0) / pos.entries.reduce((s, e) => s + e.size, 0);
@@ -421,7 +487,7 @@ export default function HyperliquidAnalytics() {
       const processed = processHyperliquidFills(fills);
       processed.accountState = state; processed.rawFillCount = fills.length;
       setData(processed);
-      if (processed.trades.length > 0) { const dates = Object.keys(processed.dailyPnl).sort(); const fy = parseInt(dates[0]?.slice(0, 4)); if (fy) setCalendarYear(fy); }
+      if (processed.trades.length > 0) { const dates = Object.keys(processed.dailyPnl).sort(); const ly = parseInt(dates[dates.length - 1]?.slice(0, 4)); if (ly) setCalendarYear(ly); }
     } catch (e) {
       const isNet = e.message?.includes("Failed to fetch") || e.message?.includes("NetworkError") || e.message?.includes("fetch");
       setError(isNet ? "NETWORK_BLOCKED" : "Failed to load data: " + e.message);
@@ -607,19 +673,22 @@ export default function HyperliquidAnalytics() {
         </div>
       )}
 
-      <div style={{ borderBottom: "1px solid " + COLORS.border, padding: "12px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.card + "cc", backdropFilter: "blur(12px)", position: "sticky", top: 0, zIndex: 100 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg, " + COLORS.accent + ", " + COLORS.accentMuted + ")", display: "flex", alignItems: "center", justifyContent: "center" }}><Activity size={16} color="white" /></div>
-          <span style={{ fontSize: 15, fontWeight: 700 }}>HL Analytics</span>
-          <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 6, background: isDemo ? COLORS.demo + "15" : COLORS.profitBg, color: isDemo ? COLORS.demo : COLORS.profit, fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>{trades.length} trades</span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span style={{ fontSize: 12, color: COLORS.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>{isDemo ? "Demo Account" : address.slice(0, 6) + "..." + address.slice(-4)}</span>
-          <button onClick={() => { setData(null); setAddress(""); setIsDemo(false); setError(null); setVerifyUrl(null); }} style={{ background: COLORS.bg, border: "1px solid " + COLORS.border, borderRadius: 8, color: COLORS.textMuted, padding: "6px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Disconnect</button>
+      <div style={{ borderBottom: "1px solid " + COLORS.border, background: COLORS.card + "cc", backdropFilter: "blur(12px)", position: "sticky", top: 0, zIndex: 100 }}>
+        <div style={{ maxWidth: 1400, margin: "0 auto", padding: "12px 24px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg, " + COLORS.accent + ", " + COLORS.accentMuted + ")", display: "flex", alignItems: "center", justifyContent: "center" }}><Activity size={16} color="white" /></div>
+            <span style={{ fontSize: 15, fontWeight: 700 }}>HL Analytics</span>
+            <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 6, background: isDemo ? COLORS.demo + "15" : COLORS.profitBg, color: isDemo ? COLORS.demo : COLORS.profit, fontWeight: 600, fontFamily: "'JetBrains Mono', monospace" }}>{trades.length} trades</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <span style={{ fontSize: 12, color: COLORS.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>{isDemo ? "Demo Account" : address.slice(0, 6) + "..." + address.slice(-4)}</span>
+            {!isDemo && <button onClick={() => { clearCachedFills(address); loadLiveData(address); }} disabled={loading} style={{ background: COLORS.bg, border: "1px solid " + COLORS.border, borderRadius: 8, color: COLORS.accent, padding: "6px 12px", cursor: loading ? "not-allowed" : "pointer", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 4, opacity: loading ? 0.5 : 1 }}><RefreshCw size={12} /> Refresh</button>}
+            <button onClick={() => { setData(null); setAddress(""); setIsDemo(false); setError(null); setVerifyUrl(null); }} style={{ background: COLORS.bg, border: "1px solid " + COLORS.border, borderRadius: 8, color: COLORS.textMuted, padding: "6px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Disconnect</button>
+          </div>
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: 2, padding: "12px 24px", borderBottom: "1px solid " + COLORS.border, overflowX: "auto" }}>
+      <div style={{ display: "flex", gap: 2, padding: "12px 24px", borderBottom: "1px solid " + COLORS.border, overflowX: "auto", maxWidth: 1400, margin: "0 auto" }}>
         {tabs.map(tab => (
           <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, background: activeTab === tab.id ? COLORS.accent + "20" : "transparent", color: activeTab === tab.id ? COLORS.accent : COLORS.textMuted, transition: "all 0.2s", whiteSpace: "nowrap" }}>
             <tab.icon size={15} /> {tab.label}
@@ -733,10 +802,18 @@ export default function HyperliquidAnalytics() {
           <div style={{ background: COLORS.card, borderRadius: 14, padding: 24, border: "1px solid " + COLORS.border }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <SectionHeader icon={Calendar} title="PnL Calendar" subtitle="Click any day to view trade details" />
-              <div style={{ display: "flex", gap: 8 }}>
-                {[calendarYear - 1, calendarYear, calendarYear + 1].filter(y => y <= new Date().getFullYear() + 1).map(y => (
-                  <button key={y} onClick={() => setCalendarYear(y)} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid " + COLORS.border, background: y === calendarYear ? COLORS.accent : "transparent", color: y === calendarYear ? "white" : COLORS.textMuted, cursor: "pointer", fontSize: 13, fontWeight: 600 }}>{y}</button>
-                ))}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {(() => {
+                  const dates = Object.keys(dailyPnl).sort();
+                  if (!dates.length) return null;
+                  const minY = parseInt(dates[0].slice(0, 4));
+                  const maxY = parseInt(dates[dates.length - 1].slice(0, 4));
+                  const years = [];
+                  for (let y = minY; y <= maxY; y++) years.push(y);
+                  return years.map(y => (
+                    <button key={y} onClick={() => setCalendarYear(y)} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid " + COLORS.border, background: y === calendarYear ? COLORS.accent : "transparent", color: y === calendarYear ? "white" : COLORS.textMuted, cursor: "pointer", fontSize: 13, fontWeight: 600 }}>{y}</button>
+                  ));
+                })()}
               </div>
             </div>
             <PnlCalendar dailyPnl={dailyPnl} year={calendarYear} onDayClick={(date, data) => setSelectedDay({ date, data })} />

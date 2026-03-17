@@ -52,3 +52,7 @@ The dashboard has 5 tabs rendered from state: Dashboard, PnL Calendar, Analytics
 ### ESLint note
 
 The flat config (`eslint.config.js`) ignores unused vars that start with an uppercase letter — this allows React component names and constants to be declared without triggering the rule.
+
+## GitHub workflow
+
+Always use the GitHub CLI (`gh`) for all GitHub operations — creating repos, PRs, issues, releases, etc. Never use the GitHub web UI or raw `git push` for operations that `gh` can handle.
