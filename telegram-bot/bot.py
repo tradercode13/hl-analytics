@@ -36,8 +36,8 @@ Guidelines:
 - For trends, fetch 10-20 activities"""
 
 client = AsyncOpenAI(
-    api_key=os.environ["GROQ_API_KEY"],
-    base_url="https://api.groq.com/openai/v1",
+    api_key=os.environ["MISTRAL_API_KEY"],
+    base_url="https://api.mistral.ai/v1",
 )
 
 STRAVA_TOOLS = [
@@ -151,7 +151,7 @@ async def _chat(user_id: int, user_message: str) -> str:
 
     while True:
         response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="mistral-small-latest",
             messages=messages,
             tools=STRAVA_TOOLS,
             tool_choice="auto",
