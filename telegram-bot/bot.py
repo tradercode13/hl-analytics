@@ -6,7 +6,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 load_dotenv()
 
-from groq import AsyncGroq
+from mistralai import Mistral
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -35,7 +35,7 @@ Guidelines:
 - Be encouraging and coach-like, not just a data dump
 - For trends, fetch 10-20 activities"""
 
-client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
 
 STRAVA_TOOLS = [
     {
@@ -147,12 +147,11 @@ async def _chat(user_id: int, user_message: str) -> str:
     )
 
     while True:
-        response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        response = await client.chat.complete_async(
+            model="mistral-small-latest",
             messages=messages,
             tools=STRAVA_TOOLS,
             tool_choice="auto",
-            max_tokens=2048,
         )
 
         msg = response.choices[0].message
@@ -160,8 +159,18 @@ async def _chat(user_id: int, user_message: str) -> str:
         if msg.tool_calls:
             messages.append({
                 "role": "assistant",
-                "content": msg.content,
-                "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
             })
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments) if tc.function.arguments else {}
@@ -169,6 +178,7 @@ async def _chat(user_id: int, user_message: str) -> str:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
+                    "name": tc.function.name,
                     "content": str(result),
                 })
         else:
