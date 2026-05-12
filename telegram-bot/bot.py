@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from collections import defaultdict
@@ -5,8 +6,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 load_dotenv()
 
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -35,77 +35,73 @@ Guidelines:
 - Be encouraging and coach-like, not just a data dump
 - For trends, fetch 10-20 activities"""
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
 
 STRAVA_TOOLS = [
-    types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="get_athlete_profile",
-                description="Get the athlete's profile: name, location, weight, FTP, follower counts.",
-            ),
-            types.FunctionDeclaration(
-                name="get_athlete_stats",
-                description="Get all-time and recent (4-week) totals: distance, time, elevation by sport type.",
-            ),
-            types.FunctionDeclaration(
-                name="get_recent_activities",
-                description="List recent activities with key metrics: type, distance, pace, heart rate, elevation.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "per_page": types.Schema(
-                            type=types.Type.INTEGER,
-                            description="Number of activities to fetch (1-30, default 10)",
-                        ),
-                        "page": types.Schema(
-                            type=types.Type.INTEGER,
-                            description="Page number (default 1)",
-                        ),
+    {
+        "type": "function",
+        "function": {
+            "name": "get_athlete_profile",
+            "description": "Get the athlete's profile: name, location, weight, FTP, follower counts.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_athlete_stats",
+            "description": "Get all-time and recent (4-week) totals: distance, time, elevation by sport type.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_activities",
+            "description": "List recent activities with key metrics: type, distance, pace, heart rate, elevation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "per_page": {"type": "integer", "description": "Number of activities to fetch (1-30, default 10)"},
+                    "page": {"type": "integer", "description": "Page number (default 1)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_activity_details",
+            "description": "Get detailed info for a specific activity: km splits, best efforts, gear.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "activity_id": {"type": "integer", "description": "Strava activity ID"},
+                },
+                "required": ["activity_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_activity_streams",
+            "description": "Get time-series stats for an activity (min/max/avg): heartrate, pace, power, cadence, altitude.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "activity_id": {"type": "integer", "description": "Strava activity ID"},
+                    "keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Stream types: heartrate, velocity_smooth, cadence, watts, altitude",
                     },
-                ),
-            ),
-            types.FunctionDeclaration(
-                name="get_activity_details",
-                description="Get detailed info for a specific activity: km splits, best efforts, gear.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "activity_id": types.Schema(
-                            type=types.Type.INTEGER,
-                            description="Strava activity ID",
-                        ),
-                    },
-                    required=["activity_id"],
-                ),
-            ),
-            types.FunctionDeclaration(
-                name="get_activity_streams",
-                description="Get time-series stats for an activity (min/max/avg): heartrate, pace, power, cadence, altitude.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "activity_id": types.Schema(
-                            type=types.Type.INTEGER,
-                            description="Strava activity ID",
-                        ),
-                        "keys": types.Schema(
-                            type=types.Type.ARRAY,
-                            items=types.Schema(type=types.Type.STRING),
-                            description="Stream types: heartrate, velocity_smooth, cadence, watts, altitude",
-                        ),
-                    },
-                    required=["activity_id"],
-                ),
-            ),
-        ]
-    )
+                },
+                "required": ["activity_id"],
+            },
+        },
+    },
 ]
-
-MODEL_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    tools=STRAVA_TOOLS,
-)
 
 strava = StravaClient(
     client_id=os.environ["STRAVA_CLIENT_ID"],
@@ -144,46 +140,41 @@ async def _call_tool(name: str, args: dict) -> str:
 async def _chat(user_id: int, user_message: str) -> str:
     user_history = history[user_id]
 
-    contents = user_history + [
-        types.Content(role="user", parts=[types.Part(text=user_message)])
-    ]
+    messages = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + user_history
+        + [{"role": "user", "content": user_message}]
+    )
 
     while True:
-        response = await client.aio.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=contents,
-            config=MODEL_CONFIG,
+        response = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            tools=STRAVA_TOOLS,
+            tool_choice="auto",
+            max_tokens=2048,
         )
 
-        parts = response.candidates[0].content.parts
-        fc_parts = [p for p in parts if p.function_call and p.function_call.name]
+        msg = response.choices[0].message
 
-        if fc_parts:
-            contents.append(response.candidates[0].content)
-
-            fn_responses = []
-            for part in fc_parts:
-                fc = part.function_call
-                args = dict(fc.args) if fc.args else {}
-                result = await _call_tool(fc.name, args)
-                fn_responses.append(
-                    types.Part(
-                        function_response=types.FunctionResponse(
-                            name=fc.name,
-                            response={"result": result},
-                        )
-                    )
-                )
-            contents.append(types.Content(role="user", parts=fn_responses))
-
+        if msg.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
+            })
+            for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                result = await _call_tool(tc.function.name, args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
         else:
-            text = "".join(p.text for p in parts if hasattr(p, "text") and p.text)
-            user_history.append(
-                types.Content(role="user", parts=[types.Part(text=user_message)])
-            )
-            user_history.append(
-                types.Content(role="model", parts=[types.Part(text=text)])
-            )
+            text = msg.content or ""
+            user_history.append({"role": "user", "content": user_message})
+            user_history.append({"role": "assistant", "content": text})
 
             if len(user_history) > MAX_TURNS * 2:
                 user_history[:] = user_history[-(MAX_TURNS * 2):]
@@ -213,9 +204,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(chunk)
     except Exception as exc:
         logger.error("Error for user %d: %s", user_id, exc, exc_info=True)
-        await update.message.reply_text(
-            "Something went wrong. Try again in a moment."
-        )
+        await update.message.reply_text("Something went wrong. Try again in a moment.")
 
 
 def main() -> None:
